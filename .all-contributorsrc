@@ -376,6 +376,30 @@
       "profile": "https://github.com/stemirkhan",
       "contributions": [
         "code",
+        "test",
+        "doc",
+        "bug"
+      ]
+    },
+    {
+      "login": "tobwen",
+      "name": "tobwen",
+      "avatar_url": "https://avatars.githubusercontent.com/u/1864057?v=4",
+      "profile": "https://github.com/tobwen",
+      "contributions": [
+        "code",
+        "test",
+        "bug"
+      ]
+    },
+    {
+      "login": "rio-jeong",
+      "name": "Rio",
+      "avatar_url": "https://avatars.githubusercontent.com/u/193858009?v=4",
+      "profile": "https://github.com/rio-jeong",
+      "contributions": [
+        "code",
+        "bug",
         "test"
       ]
     }

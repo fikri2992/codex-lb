@@ -141,6 +141,7 @@ from app.modules.proxy.repo_bundle import ProxyRepoFactory, ProxyRepositories
 from app.modules.proxy.request_policy import (
     apply_api_key_enforcement,
     normalize_responses_request_payload,
+    openai_client_payload_error,
     openai_invalid_payload_error,
     openai_validation_error,
     validate_model_access,
@@ -161,10 +162,8 @@ from app.modules.usage.updater import UsageUpdater
 
 logger = logging.getLogger(__name__)
 
-# Stay below the common 16 MiB websocket message ceiling so we can slim or fail
-# early before upstream closes the session with 1009.
-_UPSTREAM_RESPONSE_CREATE_WARN_BYTES = 12 * 1024 * 1024
-_UPSTREAM_RESPONSE_CREATE_MAX_BYTES = 15 * 1024 * 1024
+_UPSTREAM_RESPONSE_CREATE_MAX_BYTES = get_settings().upstream_response_create_max_bytes
+_UPSTREAM_RESPONSE_CREATE_WARN_BYTES = int(_UPSTREAM_RESPONSE_CREATE_MAX_BYTES * 0.8)
 _OVERSIZED_RESPONSE_CREATE_DUMP_DIR = Path("/var/lib/codex-lb/debug/response-create-dumps")
 _OVERSIZED_RESPONSE_CREATE_LARGEST_ITEMS = 10
 _RESPONSE_CREATE_HISTORY_OMISSION_NOTICE = (
@@ -2031,7 +2030,7 @@ class ProxyService:
                                 async with client_send_lock:
                                     await websocket.send_text(
                                         _serialize_websocket_error_event(
-                                            _wrapped_websocket_error_event(400, openai_invalid_payload_error(exc.param))
+                                            _wrapped_websocket_error_event(400, openai_client_payload_error(exc))
                                         )
                                     )
                                 continue
@@ -6271,6 +6270,50 @@ class ProxyService:
 
     async def rate_limit_headers(self) -> dict[str, str]:
         return await get_rate_limit_headers_cache().get(self._compute_rate_limit_headers)
+
+    async def rewrite_request_log_model(self, request_id: str, model: str) -> None:
+        """Override the ``model`` field on any ``request_logs`` row that
+        matches ``request_id``.
+
+        Used by route adapters that translate a public request shape
+        (currently ``/v1/images/*``) into an internal Responses request: the
+        first-pass log row stores the internal host model the proxy used
+        for routing, and we rewrite it here once the public effective model
+        is known so dashboards and usage views surface the user-visible
+        ``gpt-image-*`` model instead of the host (e.g. ``gpt-5.5``).
+
+        The upstream ``stream_responses`` generator writes its request_log
+        row from a ``finally`` block that runs after the last chunk is
+        yielded, which can race with the call site here. We therefore retry
+        a few times with short backoff while the row is still missing.
+        """
+        if not request_id or not model:
+            return
+        with anyio.CancelScope(shield=True):
+            try:
+                rowcount = 0
+                # Total wait: 0 + 50 + 100 + 200 + 400 + 800 ms = 1550 ms.
+                for delay in (0.0, 0.05, 0.1, 0.2, 0.4, 0.8):
+                    if delay > 0:
+                        await asyncio.sleep(delay)
+                    async with self._repo_factory() as repos:
+                        rowcount = await repos.request_logs.update_model_for_request(request_id, model)
+                    if rowcount:
+                        break
+                if not rowcount:
+                    logger.warning(
+                        "rewrite_request_log_model: request_log row for %s never appeared; "
+                        "public effective model %s not recorded",
+                        request_id,
+                        model,
+                    )
+            except Exception:
+                logger.warning(
+                    "failed to rewrite request_log model request_id=%s model=%s",
+                    request_id,
+                    model,
+                    exc_info=True,
+                )
 
     async def _compute_rate_limit_headers(self) -> dict[str, str]:
         headers: dict[str, str] = {}

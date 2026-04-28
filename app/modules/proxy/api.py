@@ -3,9 +3,9 @@ from __future__ import annotations
 import inspect
 import logging
 import time
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from datetime import datetime, timezone
-from typing import cast
+from typing import Final, cast
 
 from fastapi import APIRouter, Body, Depends, File, Form, Request, Response, Security, UploadFile, WebSocket
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -31,6 +31,7 @@ from app.core.middleware.api_firewall import _parse_trusted_proxy_networks, reso
 from app.core.openai.chat_requests import ChatCompletionsRequest
 from app.core.openai.chat_responses import ChatCompletionResult, collect_chat_completion, stream_chat_chunks
 from app.core.openai.exceptions import ClientPayloadError
+from app.core.openai.images import V1ImageResponse, V1ImagesEditsForm, V1ImagesGenerationsRequest
 from app.core.openai.model_registry import UpstreamModel, get_model_registry, is_public_model
 from app.core.openai.models import (
     CompactResponseResult,
@@ -59,18 +60,19 @@ from app.modules.api_keys.service import (
     ApiKeyInvalidError,
     ApiKeyRateLimitExceededError,
     ApiKeySelfLimitData,
-    ApiKeySelfUsageData,
     ApiKeysService,
     ApiKeyUsageReservationData,
 )
 from app.modules.firewall.repository import FirewallRepository
 from app.modules.firewall.service import FirewallRepositoryPort, FirewallService
+from app.modules.proxy import images_service as images_service_module
 from app.modules.proxy import service as proxy_service_module
 from app.modules.proxy.helpers import _rate_limit_details
 from app.modules.proxy.http_bridge_forwarding import parse_forwarded_request
 from app.modules.proxy.request_policy import (
     apply_api_key_enforcement,
-    openai_invalid_payload_error,
+    enforce_strict_text_format,
+    openai_client_payload_error,
     openai_validation_error,
     validate_model_access,
 )
@@ -152,6 +154,27 @@ _UNAVAILABLE_SELECTION_ERROR_CODES = {
     "no_additional_quota_eligible_accounts",
 }
 
+# OpenAI error ``type`` -> HTTP status for the /v1/images/* non-streaming
+# error path. The /v1/responses path has its own ``_status_for_error``
+# helper that operates on a parsed ``OpenAIError`` model; the image
+# adapter works with raw envelope dicts so we map directly here.
+_IMAGE_ERROR_TYPE_STATUS: Final[dict[str, int]] = {
+    "invalid_request_error": 400,
+    "authentication_error": 401,
+    "permission_error": 403,
+    "not_found_error": 404,
+    "rate_limit_error": 429,
+    "insufficient_quota": 429,
+}
+
+# OpenAI error ``code`` -> HTTP status, applied as a higher-precedence
+# override before the type-based mapping above.
+_IMAGE_ERROR_CODE_STATUS: Final[dict[str, int]] = {
+    "content_policy_violation": 400,
+    "rate_limit_exceeded": 429,
+    "insufficient_quota": 429,
+}
+
 
 @router.post(
     "/responses",
@@ -225,8 +248,9 @@ async def v1_responses(
 ) -> Response:
     try:
         responses_payload = payload.to_responses_request()
+        enforce_strict_text_format(responses_payload)
     except ClientPayloadError as exc:
-        error = openai_invalid_payload_error(exc.param)
+        error = openai_client_payload_error(exc)
         return _logged_error_json_response(request, 400, error)
     except ValidationError as exc:
         error = openai_validation_error(exc)
@@ -355,32 +379,13 @@ async def v1_usage(
         total_tokens=usage.total_tokens,
         cached_input_tokens=usage.cached_input_tokens,
         total_cost_usd=usage.total_cost_usd,
-        limits=_build_v1_usage_limits(usage, aggregate_limits),
+        limits=[_to_v1_usage_limit_response(limit) for limit in usage.limits],
+        upstream_limits=_ordered_aggregate_limits(aggregate_limits),
     )
 
 
-def _build_v1_usage_limits(
-    usage: ApiKeySelfUsageData,
-    aggregate_limits: dict[str, V1UsageLimitResponse],
-) -> list[V1UsageLimitResponse]:
-    raw_limits = [_to_v1_usage_limit_response(limit) for limit in usage.limits]
-    credit_overrides = {
-        limit.limit_window: limit
-        for limit in usage.limits
-        if limit.limit_type == "credits" and limit.model_filter is None
-    }
-
-    if aggregate_limits:
-        merged: list[V1UsageLimitResponse] = []
-        for window in ("5h", "7d"):
-            aggregate = aggregate_limits.get(window)
-            if aggregate is None:
-                continue
-            merged.append(_apply_credit_override(aggregate, credit_overrides.get(window)))
-        if {item.limit_window for item in merged} == {"5h", "7d"}:
-            return merged
-
-    return raw_limits
+def _ordered_aggregate_limits(aggregate_limits: dict[str, V1UsageLimitResponse]) -> list[V1UsageLimitResponse]:
+    return [limit for window in ("5h", "7d") if (limit := aggregate_limits.get(window)) is not None]
 
 
 def _to_v1_usage_limit_response(limit: ApiKeySelfLimitData) -> V1UsageLimitResponse:
@@ -394,27 +399,6 @@ def _to_v1_usage_limit_response(limit: ApiKeySelfLimitData) -> V1UsageLimitRespo
         model_filter=limit.model_filter,
         reset_at=limit.reset_at.isoformat() + "Z",
         source=limit.source,
-    )
-
-
-def _apply_credit_override(
-    aggregate_limit: V1UsageLimitResponse,
-    override_limit: ApiKeySelfLimitData | None,
-) -> V1UsageLimitResponse:
-    if override_limit is None:
-        return aggregate_limit
-
-    override_max = max(0, override_limit.max_value)
-    current_value = max(0, min(aggregate_limit.current_value, override_max))
-    return V1UsageLimitResponse(
-        limit_type="credits",
-        limit_window=aggregate_limit.limit_window,
-        max_value=override_max,
-        current_value=current_value,
-        remaining_value=max(0, override_max - current_value),
-        model_filter=None,
-        reset_at=aggregate_limit.reset_at,
-        source="api_key_override",
     )
 
 
@@ -599,6 +583,603 @@ async def v1_audio_transcriptions(
     )
 
 
+@v1_router.post("/images/generations", response_model=None)
+async def v1_images_generations(
+    request: Request,
+    payload: V1ImagesGenerationsRequest = Body(...),
+    context: ProxyContext = Depends(get_proxy_context),
+    api_key: ApiKeyData | None = Security(validate_proxy_api_key),
+) -> Response:
+    return await _proxy_images_generation_request(
+        request=request,
+        payload=payload,
+        context=context,
+        api_key=api_key,
+    )
+
+
+@v1_router.post("/images/edits", response_model=None)
+async def v1_images_edits(
+    request: Request,
+    # All typed form fields below are bound as raw strings so FastAPI
+    # never 422s on malformed input (e.g. ``n=abc``). Pydantic on
+    # ``V1ImagesEditsForm`` coerces and validates them and surfaces any
+    # failure as an OpenAI-shape ``invalid_request_error`` envelope.
+    model: str | None = Form(None),
+    prompt: str = Form(...),
+    # Accept either the OpenAI canonical ``image`` form key (single or
+    # repeated) or the ``image[]`` array-style key that some OpenAI SDKs
+    # / HTTP clients emit when sending multiple files. Both are bound as
+    # ``list[UploadFile] = File(None)`` and merged below; at least one
+    # entry must be present after the merge.
+    image: list[UploadFile] | None = File(None),
+    image_brackets: list[UploadFile] | None = File(None, alias="image[]"),
+    mask: UploadFile | None = File(None),
+    n: str | None = Form(None),
+    size: str | None = Form(None),
+    quality: str | None = Form(None),
+    background: str | None = Form(None),
+    output_format: str | None = Form(None),
+    output_compression: str | None = Form(None),
+    moderation: str | None = Form(None),
+    partial_images: str | None = Form(None),
+    stream: str | None = Form(None),
+    input_fidelity: str | None = Form(None),
+    user: str | None = Form(None),
+    context: ProxyContext = Depends(get_proxy_context),
+    api_key: ApiKeyData | None = Security(validate_proxy_api_key),
+) -> Response:
+    raw_form: dict[str, object] = {
+        "model": model,
+        "prompt": prompt,
+        "size": size if size is not None else "auto",
+        "quality": quality if quality is not None else "auto",
+        "background": background if background is not None else "auto",
+        "output_format": output_format if output_format is not None else "png",
+        "moderation": moderation if moderation is not None else "auto",
+        "input_fidelity": input_fidelity,
+        "user": user,
+    }
+    # Pydantic coerces these scalar fields from strings on its own as
+    # long as the value is a valid representation (e.g. "1", "true");
+    # invalid values land in ValidationError below and we map to
+    # ``invalid_request_error`` rather than letting FastAPI 422.
+    if n is not None:
+        raw_form["n"] = n
+    else:
+        raw_form["n"] = 1
+    if output_compression is not None:
+        raw_form["output_compression"] = output_compression
+    else:
+        raw_form["output_compression"] = 100
+    if partial_images is not None:
+        raw_form["partial_images"] = partial_images
+    if stream is not None:
+        raw_form["stream"] = stream
+    else:
+        raw_form["stream"] = False
+    try:
+        form_payload = V1ImagesEditsForm.model_validate(raw_form)
+    except ValidationError as exc:
+        return _logged_error_json_response(request, 400, openai_validation_error(exc))
+
+    # Merge ``image`` and ``image[]`` into a single ordered list. Both
+    # form keys are accepted so OpenAI SDKs and HTTP clients that pick
+    # either convention work without modification.
+    merged_images: list[UploadFile] = []
+    if image:
+        merged_images.extend(image)
+    if image_brackets:
+        merged_images.extend(image_brackets)
+    if not merged_images:
+        return _logged_error_json_response(
+            request,
+            400,
+            images_service_module.make_invalid_request_error(
+                "At least one ``image`` (or ``image[]``) multipart part is required.",
+                param="image",
+            ),
+        )
+
+    images_payload: list[tuple[bytes, str | None]] = []
+    for upload in merged_images:
+        try:
+            data = await upload.read()
+        finally:
+            await upload.close()
+        if not data:
+            return _logged_error_json_response(
+                request,
+                400,
+                images_service_module.make_invalid_request_error(
+                    "image part is empty",
+                    param="image",
+                ),
+            )
+        images_payload.append((data, upload.content_type))
+
+    mask_payload: tuple[bytes, str | None] | None = None
+    if mask is not None:
+        try:
+            data = await mask.read()
+        finally:
+            await mask.close()
+        if not data:
+            return _logged_error_json_response(
+                request,
+                400,
+                images_service_module.make_invalid_request_error(
+                    "mask part is empty",
+                    param="mask",
+                ),
+            )
+        mask_payload = (data, mask.content_type)
+
+    return await _proxy_images_edit_request(
+        request=request,
+        payload=form_payload,
+        images=images_payload,
+        mask=mask_payload,
+        context=context,
+        api_key=api_key,
+    )
+
+
+@v1_router.post("/images/variations", include_in_schema=False)
+async def v1_images_variations(
+    request: Request,
+    api_key: ApiKeyData | None = Security(validate_proxy_api_key),
+) -> Response:
+    # ``api_key`` is captured purely so the standard
+    # ``Security(validate_proxy_api_key)`` dependency runs and rejects
+    # unauthenticated callers with the same policy as every other
+    # /v1/images/* route (and the rest of /v1). Without it, this
+    # endpoint would return a public 404 even when proxy API-key auth
+    # is enabled, which is an inconsistent auth surface.
+    del api_key
+    return _logged_error_json_response(
+        request,
+        status_code=404,
+        content=images_service_module.make_not_found_error(
+            "/v1/images/variations is not supported by codex-lb. Use /v1/images/edits with an explicit prompt instead."
+        ),
+    )
+
+
+async def _prime_upstream_stream(
+    request: Request,
+    upstream: AsyncIterator[str],
+    rate_limit_headers: Mapping[str, str],
+    *,
+    on_error: Callable[[], Awaitable[None]] | None = None,
+) -> tuple[AsyncIterator[str] | None, Response | None]:
+    """Pull the first chunk from ``upstream`` so any error raised before the
+    first SSE event is surfaced as a structured OpenAI error envelope
+    instead of a broken/truncated stream.
+
+    Returns ``(primed_iterator, None)`` on success, where the returned
+    iterator yields the captured first chunk followed by the rest of
+    ``upstream``. Returns ``(None, error_response)`` when the upstream
+    raised before yielding anything; in that case ``on_error`` is called
+    so the caller can release reservations.
+    """
+    iterator = upstream.__aiter__()
+    try:
+        first_chunk = await iterator.__anext__()
+    except StopAsyncIteration:
+        first_chunk = None
+    except ProxyResponseError as exc:
+        if on_error is not None:
+            await on_error()
+        return None, _logged_error_json_response(
+            request,
+            exc.status_code,
+            exc.payload,
+            headers=dict(rate_limit_headers),
+        )
+
+    async def _replay() -> AsyncIterator[str]:
+        if first_chunk is not None:
+            yield first_chunk
+        async for chunk in iterator:
+            yield chunk
+
+    return _replay(), None
+
+
+async def _proxy_images_generation_request(
+    *,
+    request: Request,
+    payload: V1ImagesGenerationsRequest,
+    context: ProxyContext,
+    api_key: ApiKeyData | None,
+) -> Response:
+    # Apply the API key's enforced model BEFORE running the cross-field
+    # validation matrix. Otherwise a request that passes validation
+    # under the client-supplied ``model`` (e.g. gpt-image-2 with a 16-
+    # multiple custom size) could silently be swapped to a different
+    # ``gpt-image-*`` variant whose validation matrix it does not
+    # satisfy, leading to a non-canonical upstream failure instead of
+    # a deterministic 400 at the API boundary.
+    settings = proxy_service_module.get_settings()
+    requested_model = payload.model  # may be None; resolved below.
+    effective_model = _effective_model_for_api_key(
+        api_key,
+        requested_model or settings.images_default_model,
+    )
+    if not images_service_module.is_supported_image_model(effective_model):
+        return _logged_error_json_response(
+            request,
+            400,
+            images_service_module.make_invalid_request_error(
+                f"Effective model '{effective_model}' is not a 'gpt-image-*' model. "
+                f"This API key is pinned to '{effective_model}' which cannot be used on "
+                f"/v1/images/* routes; use a key that allows gpt-image models.",
+                param="model",
+            ),
+        )
+    if effective_model != requested_model:
+        # Rebind ``payload.model`` so the validation matrix below, the
+        # downstream translation, request logging, and tool config all
+        # see the enforced (or default-resolved) value.
+        payload = payload.model_copy(update={"model": effective_model})
+
+    try:
+        payload = images_service_module.validate_generations_payload(payload)
+    except ClientPayloadError as exc:
+        return _logged_error_json_response(request, 400, openai_client_payload_error(exc))
+
+    public_model = payload.model
+    assert public_model is not None
+    host_model = settings.images_host_model
+
+    try:
+        validate_model_access(api_key, effective_model)
+    except Exception:
+        # Re-raise so the global handler maps to 403.
+        raise
+
+    rate_limit_headers = await context.service.rate_limit_headers()
+    reservation = await _enforce_request_limits(
+        api_key,
+        request_model=effective_model,
+        request_service_tier=None,
+    )
+
+    try:
+        responses_payload = images_service_module.images_generation_to_responses_request(payload, host_model=host_model)
+    except ValidationError as exc:
+        await _release_reservation(reservation)
+        return _logged_error_json_response(
+            request,
+            400,
+            openai_validation_error(exc),
+            headers=rate_limit_headers,
+        )
+
+    # We always need an upstream stream because tool_usage.image_gen only
+    # appears on response.completed. For non-streaming clients we drain the
+    # stream and translate to a JSON envelope.
+    # Pass ``api_key_reservation=None`` so the standard stream settlement
+    # in ``_settle_stream_api_key_usage`` does NOT release/finalize the
+    # reservation from ``response.usage`` (which is typically empty for
+    # the image_generation tool path). The image route owns the
+    # reservation lifecycle and finalizes it from the captured
+    # ``tool_usage.image_gen`` tokens via ``_finalize_image_reservation``,
+    # which avoids the double-billing scenario where standard settlement
+    # would charge ``response.usage`` and we would also charge the image
+    # tokens.
+    upstream = context.service.stream_responses(
+        responses_payload,
+        request.headers,
+        codex_session_affinity=False,
+        propagate_http_errors=True,
+        openai_cache_affinity=True,
+        api_key=api_key,
+        api_key_reservation=None,
+    )
+
+    # ``images_service`` populates ``response_id`` once the upstream stream
+    # surfaces the Responses id, so we can rewrite the request log's model
+    # column from the internal host model to the public ``gpt-image-*``
+    # value the client actually requested.
+    captured: dict[str, object] = {}
+
+    # Prime the upstream stream so that errors raised before the first
+    # chunk (e.g. exhausted retries propagating a ProxyResponseError) are
+    # surfaced as structured OpenAI error envelopes instead of broken /
+    # truncated SSE streams. ``_prime_upstream_stream`` returns either
+    # ``(primed_iterator, None)`` on success or ``(None, error_response)``
+    # when the upstream raised before yielding anything.
+    primed_upstream, prime_error = await _prime_upstream_stream(
+        request,
+        upstream,
+        rate_limit_headers,
+        on_error=lambda: _release_reservation(reservation),
+    )
+    if prime_error is not None:
+        return prime_error
+    assert primed_upstream is not None
+
+    if payload.stream:
+        translated = images_service_module.translate_responses_stream_to_images_stream(
+            primed_upstream, captured=captured
+        )
+
+        async def _stream_with_log_rewrite() -> AsyncIterator[bytes]:
+            try:
+                async for chunk in translated:
+                    yield chunk.encode("utf-8") if isinstance(chunk, str) else chunk
+            finally:
+                # Run the request-log model rewrite even when the stream
+                # is cancelled mid-flight (e.g. client disconnect). Without
+                # this, an interrupted SSE response would leave the
+                # request_logs row pinned to the internal host model.
+                response_id = captured.get("response_id")
+                if response_id and isinstance(response_id, str):
+                    await context.service.rewrite_request_log_model(response_id, public_model)
+                # Finalize the reservation from the captured
+                # ``tool_usage.image_gen`` tokens (or release if
+                # upstream never produced a usable image). This is the
+                # single point where the image API charges API-key
+                # limits; standard stream settlement is bypassed via
+                # ``api_key_reservation=None`` above.
+                _input = captured.get("image_input_tokens")
+                _output = captured.get("image_output_tokens")
+                _cached = captured.get("image_cached_input_tokens")
+                await _finalize_image_reservation(
+                    reservation,
+                    model=public_model,
+                    input_tokens=_input if isinstance(_input, int) else None,
+                    output_tokens=_output if isinstance(_output, int) else None,
+                    cached_input_tokens=_cached if isinstance(_cached, int) else None,
+                )
+
+        return StreamingResponse(
+            _stream_with_log_rewrite(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", **rate_limit_headers},
+        )
+
+    try:
+        response_payload, error_envelope = await images_service_module.collect_responses_stream_for_images(
+            primed_upstream,
+            captured=captured,
+        )
+    except ProxyResponseError as exc:
+        await _release_reservation(reservation)
+        return _logged_error_json_response(
+            request,
+            exc.status_code,
+            exc.payload,
+            headers=rate_limit_headers,
+        )
+
+    response_id = captured.get("response_id")
+    if response_id and isinstance(response_id, str):
+        await context.service.rewrite_request_log_model(response_id, public_model)
+    _input = captured.get("image_input_tokens")
+    _output = captured.get("image_output_tokens")
+    _cached = captured.get("image_cached_input_tokens")
+    await _finalize_image_reservation(
+        reservation,
+        model=public_model,
+        input_tokens=_input if isinstance(_input, int) else None,
+        output_tokens=_output if isinstance(_output, int) else None,
+        cached_input_tokens=_cached if isinstance(_cached, int) else None,
+    )
+
+    if error_envelope is not None:
+        return _logged_error_json_response(
+            request,
+            _status_for_image_error_envelope(error_envelope),
+            error_envelope,
+            headers=rate_limit_headers,
+        )
+    assert response_payload is not None
+    images_result = images_service_module.images_response_from_responses(response_payload)
+    if not isinstance(images_result, V1ImageResponse):
+        return _logged_error_json_response(
+            request,
+            _status_for_image_error_envelope(images_result),
+            images_result,
+            headers=rate_limit_headers,
+        )
+    return JSONResponse(
+        content=images_result.model_dump(mode="json", exclude_none=True),
+        headers=rate_limit_headers,
+    )
+
+
+async def _proxy_images_edit_request(
+    *,
+    request: Request,
+    payload: V1ImagesEditsForm,
+    images: list[tuple[bytes, str | None]],
+    mask: tuple[bytes, str | None] | None,
+    context: ProxyContext,
+    api_key: ApiKeyData | None,
+) -> Response:
+    # Apply the API key's enforced model BEFORE validating the
+    # cross-field matrix, so the matrix is checked against the model we
+    # will actually send upstream. See the matching comment in
+    # ``_proxy_images_generation_request``.
+    settings = proxy_service_module.get_settings()
+    requested_model = payload.model
+    effective_model = _effective_model_for_api_key(
+        api_key,
+        requested_model or settings.images_default_model,
+    )
+    if not images_service_module.is_supported_image_model(effective_model):
+        return _logged_error_json_response(
+            request,
+            400,
+            images_service_module.make_invalid_request_error(
+                f"Effective model '{effective_model}' is not a 'gpt-image-*' model. "
+                f"This API key is pinned to '{effective_model}' which cannot be used on "
+                f"/v1/images/* routes; use a key that allows gpt-image models.",
+                param="model",
+            ),
+        )
+    if effective_model != requested_model:
+        payload = payload.model_copy(update={"model": effective_model})
+
+    try:
+        payload = images_service_module.validate_edits_payload(payload)
+    except ClientPayloadError as exc:
+        return _logged_error_json_response(request, 400, openai_client_payload_error(exc))
+
+    public_model = payload.model
+    assert public_model is not None
+    host_model = settings.images_host_model
+
+    validate_model_access(api_key, effective_model)
+
+    rate_limit_headers = await context.service.rate_limit_headers()
+    reservation = await _enforce_request_limits(
+        api_key,
+        request_model=effective_model,
+        request_service_tier=None,
+    )
+
+    try:
+        responses_payload = images_service_module.images_edit_to_responses_request(
+            payload,
+            host_model=host_model,
+            images=images,
+            mask=mask,
+        )
+    except (ValidationError, ValueError) as exc:
+        await _release_reservation(reservation)
+        if isinstance(exc, ValidationError):
+            return _logged_error_json_response(
+                request,
+                400,
+                openai_validation_error(exc),
+                headers=rate_limit_headers,
+            )
+        return _logged_error_json_response(
+            request,
+            400,
+            images_service_module.make_invalid_request_error(str(exc)),
+            headers=rate_limit_headers,
+        )
+
+    # See ``_proxy_images_generation_request`` for why we pass
+    # ``api_key_reservation=None`` and finalize via
+    # ``_finalize_image_reservation`` instead.
+    upstream = context.service.stream_responses(
+        responses_payload,
+        request.headers,
+        codex_session_affinity=False,
+        propagate_http_errors=True,
+        openai_cache_affinity=True,
+        api_key=api_key,
+        api_key_reservation=None,
+    )
+
+    captured: dict[str, object] = {}
+
+    primed_upstream, prime_error = await _prime_upstream_stream(
+        request,
+        upstream,
+        rate_limit_headers,
+        on_error=lambda: _release_reservation(reservation),
+    )
+    if prime_error is not None:
+        return prime_error
+    assert primed_upstream is not None
+
+    if payload.stream:
+        translated = images_service_module.translate_responses_stream_to_images_stream(
+            primed_upstream, captured=captured, is_edit=True
+        )
+
+        async def _stream_with_log_rewrite() -> AsyncIterator[bytes]:
+            try:
+                async for chunk in translated:
+                    yield chunk.encode("utf-8") if isinstance(chunk, str) else chunk
+            finally:
+                # Run the request-log model rewrite even when the stream
+                # is cancelled mid-flight (e.g. client disconnect). Without
+                # this, an interrupted SSE response would leave the
+                # request_logs row pinned to the internal host model.
+                response_id = captured.get("response_id")
+                if response_id and isinstance(response_id, str):
+                    await context.service.rewrite_request_log_model(response_id, public_model)
+                # Finalize the reservation from the captured
+                # ``tool_usage.image_gen`` tokens (or release if
+                # upstream never produced a usable image). This is the
+                # single point where the image API charges API-key
+                # limits; standard stream settlement is bypassed via
+                # ``api_key_reservation=None`` above.
+                _input = captured.get("image_input_tokens")
+                _output = captured.get("image_output_tokens")
+                _cached = captured.get("image_cached_input_tokens")
+                await _finalize_image_reservation(
+                    reservation,
+                    model=public_model,
+                    input_tokens=_input if isinstance(_input, int) else None,
+                    output_tokens=_output if isinstance(_output, int) else None,
+                    cached_input_tokens=_cached if isinstance(_cached, int) else None,
+                )
+
+        return StreamingResponse(
+            _stream_with_log_rewrite(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", **rate_limit_headers},
+        )
+
+    try:
+        response_payload, error_envelope = await images_service_module.collect_responses_stream_for_images(
+            primed_upstream,
+            captured=captured,
+        )
+    except ProxyResponseError as exc:
+        await _release_reservation(reservation)
+        return _logged_error_json_response(
+            request,
+            exc.status_code,
+            exc.payload,
+            headers=rate_limit_headers,
+        )
+
+    response_id = captured.get("response_id")
+    if response_id and isinstance(response_id, str):
+        await context.service.rewrite_request_log_model(response_id, public_model)
+    _input = captured.get("image_input_tokens")
+    _output = captured.get("image_output_tokens")
+    _cached = captured.get("image_cached_input_tokens")
+    await _finalize_image_reservation(
+        reservation,
+        model=public_model,
+        input_tokens=_input if isinstance(_input, int) else None,
+        output_tokens=_output if isinstance(_output, int) else None,
+        cached_input_tokens=_cached if isinstance(_cached, int) else None,
+    )
+
+    if error_envelope is not None:
+        return _logged_error_json_response(
+            request,
+            _status_for_image_error_envelope(error_envelope),
+            error_envelope,
+            headers=rate_limit_headers,
+        )
+    assert response_payload is not None
+    images_result = images_service_module.images_response_from_responses(response_payload)
+    if not isinstance(images_result, V1ImageResponse):
+        return _logged_error_json_response(
+            request,
+            _status_for_image_error_envelope(images_result),
+            images_result,
+            headers=rate_limit_headers,
+        )
+    return JSONResponse(
+        content=images_result.model_dump(mode="json", exclude_none=True),
+        headers=rate_limit_headers,
+    )
+
+
 async def _build_codex_models_response(api_key: ApiKeyData | None) -> Response:
     reservation = await _enforce_request_limits(
         api_key,
@@ -776,8 +1357,9 @@ async def v1_chat_completions(
     rate_limit_headers = await context.service.rate_limit_headers()
     try:
         responses_payload = payload.to_responses_request()
+        enforce_strict_text_format(responses_payload)
     except ClientPayloadError as exc:
-        error = openai_invalid_payload_error(exc.param)
+        error = openai_client_payload_error(exc)
         return _logged_error_json_response(request, 400, error, headers=rate_limit_headers)
     except ValidationError as exc:
         error = openai_validation_error(exc)
@@ -1046,7 +1628,7 @@ async def v1_responses_compact(
     try:
         compact_payload = payload.to_compact_request()
     except ClientPayloadError as exc:
-        error = openai_invalid_payload_error(exc.param)
+        error = openai_client_payload_error(exc)
         return _logged_error_json_response(request, 400, error)
     except ValidationError as exc:
         error = openai_validation_error(exc)
@@ -1311,6 +1893,57 @@ async def _release_reservation(reservation: ApiKeyUsageReservationData | None) -
     async with get_background_session() as session:
         service = ApiKeysService(ApiKeysRepository(session))
         await service.release_usage_reservation(reservation.reservation_id)
+
+
+async def _finalize_image_reservation(
+    reservation: ApiKeyUsageReservationData | None,
+    *,
+    model: str,
+    input_tokens: int | None,
+    output_tokens: int | None,
+    cached_input_tokens: int | None = None,
+) -> None:
+    """Finalize the API-key usage reservation for a ``/v1/images/*`` call.
+
+    The image adapter bypasses the standard stream settlement (``stream_responses``
+    is invoked with ``api_key_reservation=None``) because the ``image_generation``
+    tool path typically leaves ``response.usage`` empty; charging from
+    ``tool_usage.image_gen`` is the only source of truth. This helper
+    finalizes the reservation with the captured image tokens when present,
+    otherwise releases it. Calling this exactly once per request prevents
+    the double-billing scenario where both the standard settlement and
+    the post-hoc image record_usage path increment limits.
+
+    Persistence errors are caught and logged so a transient DB/session
+    failure during the tail accounting cannot turn a successfully
+    generated image into a user-facing 500 (non-streaming) or an
+    abrupt stream termination (streaming). This mirrors the
+    best-effort accounting policy used by
+    ``ProxyService._settle_stream_api_key_usage``.
+    """
+    if reservation is None:
+        return
+    try:
+        if not input_tokens and not output_tokens:
+            await _release_reservation(reservation)
+            return
+        async with get_background_session() as session:
+            service = ApiKeysService(ApiKeysRepository(session))
+            await service.finalize_usage_reservation(
+                reservation.reservation_id,
+                model=model,
+                input_tokens=int(input_tokens or 0),
+                output_tokens=int(output_tokens or 0),
+                cached_input_tokens=int(cached_input_tokens or 0),
+                service_tier=None,
+            )
+    except Exception:
+        logger.warning(
+            "failed to finalize image reservation reservation_id=%s model=%s",
+            reservation.reservation_id,
+            model,
+            exc_info=True,
+        )
 
 
 def _effective_model_for_api_key(api_key: ApiKeyData | None, requested_model: str) -> str:
@@ -1673,4 +2306,30 @@ def _status_for_error(error_value: OpenAIError | None) -> int:
         return 400
     if error_value and error_value.code in _UNAVAILABLE_SELECTION_ERROR_CODES:
         return 503
+    return 502
+
+
+def _status_for_image_error_envelope(envelope: object) -> int:
+    """Map an OpenAI-shape error envelope dict to its canonical HTTP status
+    for the ``/v1/images/*`` non-streaming response path.
+
+    Returns 502 when no specific mapping matches (e.g. server_error or an
+    unrecognised type), so transport-level failures still surface as
+    upstream errors. Code matches take precedence over type matches.
+    """
+    if not isinstance(envelope, Mapping):
+        return 502
+    error = cast(Mapping[str, object], envelope).get("error")
+    if not isinstance(error, Mapping):
+        return 502
+    error_map = cast(Mapping[str, object], error)
+    code = error_map.get("code")
+    if isinstance(code, str):
+        if code in _IMAGE_ERROR_CODE_STATUS:
+            return _IMAGE_ERROR_CODE_STATUS[code]
+        if code in _UNAVAILABLE_SELECTION_ERROR_CODES:
+            return 503
+    error_type = error_map.get("type")
+    if isinstance(error_type, str) and error_type in _IMAGE_ERROR_TYPE_STATUS:
+        return _IMAGE_ERROR_TYPE_STATUS[error_type]
     return 502
